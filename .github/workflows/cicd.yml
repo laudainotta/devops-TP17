@@ -99,4 +99,24 @@ jobs:
           path: gitleaks-report.json
           retention-days: 14
 
-      - name: Publicar
+      - name: Publicar Resumen en $GITHUB_STEP_SUMMARY
+        run: |
+          echo "### Reporte de Inspección de Secretos (Gitleaks) :clipboard:" >> $GITHUB_STEP_SUMMARY
+          echo "El informe JSON detallado de auditoría de Git se ha adjuntado como **Artifact**." >> $GITHUB_STEP_SUMMARY
+          echo "```json" >> $GITHUB_STEP_SUMMARY
+          head -n 30 gitleaks-report.json || echo "[]" >> $GITHUB_STEP_SUMMARY
+          echo "```" >> $GITHUB_STEP_SUMMARY
+
+  # =========================================================================
+  # FASE 3: RELEASE & DEPLOY (Post-Aprobación de Ciberseguridad)
+  # =========================================================================
+  deploy-k8s-helm:
+    name: "Fase 3: Release & Deploy Helm K8s"
+    runs-on: ubuntu-latest
+    needs: [build-and-package, gitleaks-andon-cord, gitleaks-audit-report]
+    if: github.ref == 'refs/head/main'
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+      - name: Continuar despliegue seguro
+        run: echo "Iniciando despliegue de Helm Chart en Kubernetes..."
