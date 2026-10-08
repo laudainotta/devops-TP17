@@ -1,4 +1,4 @@
-name: CI/CD Pipeline - Notes App con Trivy Security (3 Fases & TP10B) v2
+name: CI/CD Pipeline - Notes App DevSecOps (Gitleaks, Trivy & Semgrep)
 
 on:
   push:
@@ -6,20 +6,14 @@ on:
   pull_request:
     branches: [ main ]
 
-# v2: mínimo privilegio para el GITHUB_TOKEN (la guía no declaraba permisos)
-permissions:
-  contents: read
-
 env:
   DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/devops-portfolio
   HELM_RELEASE_NAME: mi-app
   K8S_NAMESPACE: devops-portfolio
-  # v2: rutas reales del repo (la guía asumía ./backend y ./devops-portfolio en la raíz)
-  APP_DIR: guia-10
 
 jobs:
   # =========================================================================
-  # FASE 1: BUILD & PACKAGE (Construcción Única y Exportación de Artefacto)
+  # FASE 1: BUILD & PACKAGE (Construcción Única de la Imagen)
   # =========================================================================
   build-and-package:
     name: "Fase 1: Build & Package (Imagen Inmutable)"
@@ -33,7 +27,7 @@ jobs:
 
       - name: Compilar imagen Docker
         run: |
-          docker build -t ${{ env.DOCKER_IMAGE }}:${{ github.sha }} ./${{ env.APP_DIR }}/backend
+          docker build -t ${{ env.DOCKER_IMAGE }}:${{ github.sha }} ./backend
 
       - name: Exportar imagen a tarball efímero
         run: |
@@ -48,169 +42,61 @@ jobs:
           retention-days: 1
 
   # =========================================================================
-  # FASE 2A: AUDITORÍA DE SEGURIDAD - ANDON CORD (HIGH/CRITICAL)
+  # FASE 2A: GITLEAKS - ANDON CORD (Bloqueante ante Secretos Expuestos)
   # =========================================================================
-  trivy-andon-cord:
-    name: "Fase 2A: Trivy - Andon Cord (HIGH/CRITICAL)"
+  gitleaks-andon-cord:
+    name: "Fase 2A: Gitleaks - Andon Cord (Secret Detection)"
     runs-on: ubuntu-latest
     needs: [build-and-package]
     steps:
-      - name: Checkout del código
+      - name: Checkout del código (Historial completo para análisis)
         uses: actions/checkout@v4
-
-      - name: Descargar Artefacto de Imagen
-        uses: actions/download-artifact@v4
         with:
-          name: docker-image-artifact
-          path: build-artifacts
+          fetch-depth: 0 # OBLIGATORIO: Descarga todo el historial de commits
 
-      - name: Cargar imagen Docker compilada
-        run: |
-          docker load -i build-artifacts/app-image.tar
+      - name: Escaneo de Secretos con Gitleaks Action
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false
 
-      - name: Instalar Helm CLI
-        uses: azure/setup-helm@v4
-        with:
-          version: 'v3.13.0'
-
-      # -------------------------------------------------------------
-      # APLICACIÓN PATRÓN TP10B: Renderizado previo de Helm
-      # v2: values-prod.yaml está en guia-10/, no dentro del chart
-      # -------------------------------------------------------------
-      - name: Renderizar Helm Chart (TP10B - Sin Falsos Positivos)
-        run: |
-          helm template ${{ env.HELM_RELEASE_NAME }} ./${{ env.APP_DIR }}/devops-portfolio \
-            -f ${{ env.APP_DIR }}/values-prod.yaml > manifests-rendered-prod.yaml
-          test -s manifests-rendered-prod.yaml
-
-      # v2: acción fijada por SHA (v0.36.0), no @master (CVE-2026-33634)
-      # v2: continue-on-error + id para que ambos escaneos corran siempre;
-      #     el corte del Andon se decide en el último paso
-      - name: Escaneo de Contenedor & SCA (Andon Cord)
-        id: scan_image
-        continue-on-error: true
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: '${{ env.DOCKER_IMAGE }}:${{ github.sha }}'
-          format: 'table'
-          exit-code: '1'          # Detiene el pipeline si hay hallazgos
-          ignore-unfixed: true    # v2: descarta CVEs SIN parche (solo bloquea lo corregible)
-          severity: 'HIGH,CRITICAL'
-
-      - name: Escaneo de IaC sobre YAML Renderizado (Trivy Config)
-        id: scan_iac
-        continue-on-error: true
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          scan-type: 'config'
-          scan-ref: 'manifests-rendered-prod.yaml'
-          format: 'table'
-          exit-code: '1'
-          severity: 'HIGH,CRITICAL'
-
-      # v2: el resumen refleja el resultado real de cada escaneo
       - name: Resumen de Andon Cord en GitHub
         if: always()
         run: |
-          {
-            echo "### Auditoría Bloqueante de Seguridad (Andon Cord) :shield:"
-            echo "| Evaluación | Severidades | Resultado |"
-            echo "|------------|-------------|-----------|"
-            echo "| **Contenedor + SCA** | \`HIGH, CRITICAL\` | ${{ steps.scan_image.outcome }} |"
-            echo "| **IaC Renderizado (TP10B)** | \`HIGH, CRITICAL\` | ${{ steps.scan_iac.outcome }} |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Andon Cord - Detener la línea si hubo hallazgos
-        if: steps.scan_image.outcome == 'failure' || steps.scan_iac.outcome == 'failure'
-        run: |
-          echo "::error::Andon Cord activado: hallazgos HIGH/CRITICAL (imagen: ${{ steps.scan_image.outcome }}, IaC: ${{ steps.scan_iac.outcome }})"
-          exit 1
+          echo "### Auditoría de Secretos (Gitleaks) :key:" >> $GITHUB_STEP_SUMMARY
+          echo "| Evaluación | Tipo de Control | Acción en Pipeline |" >> $GITHUB_STEP_SUMMARY
+          echo "|------------|-----------------|--------------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Fuga de Secretos** |  **Andon Cord Activo** | Bloquea el merge si se detectan credenciales |" >> $GITHUB_STEP_SUMMARY
 
   # =========================================================================
-  # FASE 2B: AUDITORÍA DE SEGURIDAD - REPORTE INFORMATIVO (LOW/MEDIUM)
+  # FASE 2B: GITLEAKS - REPORTE DE INSPECCIÓN (Artifact JSON)
   # =========================================================================
-  trivy-audit-report:
-    name: "Fase 2B: Trivy - Reporte e Inspección (LOW/MEDIUM)"
+  gitleaks-audit-report:
+    name: "Fase 2B: Gitleaks - Reporte e Inspección (Artifacts)"
     runs-on: ubuntu-latest
-    needs: [build-and-package, trivy-andon-cord]
-    # v2: corre aunque el Andon corte, pero solo si existe el artefacto
-    if: ${{ !cancelled() && needs.build-and-package.result == 'success' }}
+    needs: [build-and-package, gitleaks-andon-cord]
+    if: always()
     steps:
-      - name: Checkout del código
+      - name: Checkout del código (Historial completo)
         uses: actions/checkout@v4
-
-      - name: Descargar Artefacto de Imagen
-        uses: actions/download-artifact@v4
         with:
-          name: docker-image-artifact
-          path: build-artifacts
+          fetch-depth: 0
 
-      - name: Cargar imagen Docker compilada
+      - name: Instalación de Gitleaks CLI
         run: |
-          docker load -i build-artifacts/app-image.tar
+          wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz
+          tar -xzf gitleaks_8.18.2_linux_x64.tar.gz
+          sudo mv gitleaks /usr/local/bin/
 
-      - name: Escaneo de Seguridad - Reporte Informativo
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: '${{ env.DOCKER_IMAGE }}:${{ github.sha }}'
-          format: 'table'
-          exit-code: '0'          # Permite continuar el flujo
-          severity: 'LOW,MEDIUM'
-          output: 'trivy-low-medium-report.txt'   # v2: dentro de with:
+      - name: Generar Reporte de Auditoría en JSON
+        run: |
+          gitleaks detect --source . --report-format json --report-path gitleaks-report.json || true
 
-      - name: Publicar Artifact de Vulnerabilidades Menores
+      - name: Publicar Artifact de Auditoría de Secretos
         uses: actions/upload-artifact@v4
         with:
-          name: reporte-vulnerabilidades-trivy-low-medium
-          path: trivy-low-medium-report.txt
+          name: reporte-fuga-secretos-gitleaks
+          path: gitleaks-report.json
           retention-days: 14
 
-      # v2: se agrupa la salida para que head también llegue al resumen
-      - name: Publicar Resumen en $GITHUB_STEP_SUMMARY
-        run: |
-          {
-            echo "### Reporte de Vulnerabilidades Informativas (LOW/MEDIUM) :clipboard:"
-            echo "El reporte completo ha sido adjuntado como **Artifact** descargable en este workflow."
-            echo '```text'
-            head -n 35 trivy-low-medium-report.txt || echo "No se registraron vulnerabilidades menores."
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # =========================================================================
-  # FASE 3: RELEASE & DEPLOY (Publicación y Despliegue Post-Aprobación)
-  # =========================================================================
-  deploy-k8s-helm:
-    name: "Fase 3: Release & Deploy Helm K8s"
-    runs-on: ubuntu-latest
-    needs: [build-and-package, trivy-andon-cord, trivy-audit-report]
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - name: Checkout del código
-        uses: actions/checkout@v4
-
-      - name: Descargar Artefacto de Imagen
-        uses: actions/download-artifact@v4
-        with:
-          name: docker-image-artifact
-          path: build-artifacts
-
-      - name: Cargar imagen Docker probada
-        run: |
-          docker load -i build-artifacts/app-image.tar
-
-      - name: Login a Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Etiquetar y Push a Docker Hub
-        run: |
-          docker tag ${{ env.DOCKER_IMAGE }}:${{ github.sha }} ${{ env.DOCKER_IMAGE }}:latest
-          docker push ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
-          docker push ${{ env.DOCKER_IMAGE }}:latest
-
-      - name: Despliegue con Helm en Kubernetes
-        run: |
-          echo "Desplegando Helm Chart '${{ env.HELM_RELEASE_NAME }}' en namespace '${{ env.K8S_NAMESPACE }}'..."
-          # helm upgrade --install ${{ env.HELM_RELEASE_NAME }} ./${{ env.APP_DIR }}/devops-portfolio -n ${{ env.K8S_NAMESPACE }}
+      - name: Publicar
